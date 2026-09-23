@@ -4,7 +4,7 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.data import InMemoryDataset
 from torch_geometric.utils import to_undirected, add_self_loops
-from torch_sparse import coalesce
+from torch_geometric.utils import coalesce
 from torch_geometric.io import read_txt_array
 
 import random
@@ -170,7 +170,7 @@ class FNNDataset(InMemoryDataset):
 		self.feature = feature
 		super(FNNDataset, self).__init__(root, transform, pre_transform, pre_filter)
 		if not empty:
-			self.data, self.slices, self.train_idx, self.val_idx, self.test_idx = torch.load(self.processed_paths[0])
+			self.data, self.slices, self.train_idx, self.val_idx, self.test_idx = torch.load(self.processed_paths[0], weights_only=False)
 
 	@property
 	def raw_dir(self):

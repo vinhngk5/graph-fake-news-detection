@@ -1,9 +1,8 @@
 import argparse
+from pathlib import Path
 import time
 from tqdm import tqdm
 import copy as cp
-import warnings
-warnings.filterwarnings("ignore")
 
 import torch
 import torch.nn.functional as F
@@ -100,7 +99,7 @@ parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
 parser.add_argument('--weight_decay', type=float, default=0.01, help='weight decay')
 parser.add_argument('--nhid', type=int, default=128, help='hidden size')
 parser.add_argument('--dropout_ratio', type=float, default=0.0, help='dropout ratio')
-parser.add_argument('--epochs', type=int, default=30, help='maximum number of epochs')
+parser.add_argument('--epochs', type=int, default=35, help='maximum number of epochs')
 parser.add_argument('--concat', type=bool, default=True, help='whether concat news embedding and graph embedding')
 parser.add_argument('--multi_gpu', type=bool, default=False, help='multi-gpu mode')
 parser.add_argument('--feature', type=str, default='bert', help='feature type, [profile, spacy, bert, content]')
@@ -111,7 +110,8 @@ torch.manual_seed(args.seed)
 if torch.cuda.is_available():
 	torch.cuda.manual_seed(args.seed)
 
-dataset = FNNDataset(root='../data', feature=args.feature, empty=False, name=args.dataset, transform=ToUndirected())
+path = Path(__file__).parent.parent.parent / 'data'
+dataset = FNNDataset(root=path, feature=args.feature, empty=False, name=args.dataset, transform=ToUndirected())
 
 args.num_classes = dataset.num_classes
 args.num_features = dataset.num_features
@@ -173,6 +173,5 @@ if __name__ == '__main__':
 			  f' recall_val: {recall_val:.4f}, auc_val: {auc_val:.4f}')
 
 	[acc, f1_macro, f1_micro, precision, recall, auc, ap], test_loss = compute_test(test_loader, verbose=False)
-	print(f'{args.dataset} {args.model} Testing Results:\n'
-		  f'acc: {acc:.4f}, f1_macro: {f1_macro:.4f}, f1_micro: {f1_micro:.4f}, '
+	print(f'Test set results: acc: {acc:.4f}, f1_macro: {f1_macro:.4f}, f1_micro: {f1_micro:.4f}, '
 		  f'precision: {precision:.4f}, recall: {recall:.4f}, auc: {auc:.4f}, ap: {ap:.4f}')
