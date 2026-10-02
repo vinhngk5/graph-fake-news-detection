@@ -4,7 +4,7 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.data import InMemoryDataset
 from torch_geometric.utils import to_undirected, add_self_loops
-from torch_sparse import coalesce
+from torch_geometric.utils import coalesce
 from torch_geometric.io import read_txt_array
 
 import random
@@ -101,41 +101,42 @@ class DropEdge:
 		Drop edge operation from BiGCN (Rumor Detection on Social Media with Bi-Directional Graph Convolutional Networks)
 		1) Generate TD and BU edge indices
 		2) Drop out edges
-		Code from https://github.com/TianBian95/BiGCN/blob/master/Process/dataset.py
+		Original code from https://github.com/TianBian95/BiGCN/blob/master/Process/dataset.py
+
+		This version is vectorized with torch ops (no Python lists / np.array
+		conversions), so it is much faster. Behaviour is the same: keep
+		int(E * (1 - droprate)) edges chosen uniformly without replacement,
+		preserving the original edge order. TD and BU are sampled independently.
 		"""
 		self.tddroprate = tddroprate
 		self.budroprate = budroprate
 
+	@staticmethod
+	def _sample_edges(num_edges, droprate):
+		"""Return sorted indices of the edges to keep."""
+		num_keep = int(num_edges * (1 - droprate))
+		return torch.randperm(num_edges)[:num_keep].sort().values
+
 	def __call__(self, data):
 		edge_index = data.edge_index
+		num_edges = edge_index.size(1)
 
+		# Top-down: original direction
 		if self.tddroprate > 0:
-			row = list(edge_index[0])
-			col = list(edge_index[1])
-			length = len(row)
-			poslist = random.sample(range(length), int(length * (1 - self.tddroprate)))
-			poslist = sorted(poslist)
-			row = list(np.array(row)[poslist])
-			col = list(np.array(col)[poslist])
-			new_edgeindex = [row, col]
+			td_edge_index = edge_index[:, self._sample_edges(num_edges, self.tddroprate)]
 		else:
-			new_edgeindex = edge_index
+			td_edge_index = edge_index
 
-		burow = list(edge_index[1])
-		bucol = list(edge_index[0])
+		# Bottom-up: reversed direction
+		bu_full = edge_index.flip(0)
 		if self.budroprate > 0:
-			length = len(burow)
-			poslist = random.sample(range(length), int(length * (1 - self.budroprate)))
-			poslist = sorted(poslist)
-			row = list(np.array(burow)[poslist])
-			col = list(np.array(bucol)[poslist])
-			bunew_edgeindex = [row, col]
+			bu_edge_index = bu_full[:, self._sample_edges(num_edges, self.budroprate)]
 		else:
-			bunew_edgeindex = [burow, bucol]
+			bu_edge_index = bu_full
 
-		data.edge_index = torch.LongTensor(new_edgeindex)
-		data.BU_edge_index = torch.LongTensor(bunew_edgeindex)
-		data.root = torch.FloatTensor(data.x[0])
+		data.edge_index = td_edge_index
+		data.BU_edge_index = bu_edge_index
+		data.root = data.x[0].clone().float()
 		data.root_index = torch.LongTensor([0])
 
 		return data
@@ -170,7 +171,7 @@ class FNNDataset(InMemoryDataset):
 		self.feature = feature
 		super(FNNDataset, self).__init__(root, transform, pre_transform, pre_filter)
 		if not empty:
-			self.data, self.slices, self.train_idx, self.val_idx, self.test_idx = torch.load(self.processed_paths[0])
+			self.data, self.slices, self.train_idx, self.val_idx, self.test_idx = torch.load(self.processed_paths[0], weights_only=False)
 
 	@property
 	def raw_dir(self):

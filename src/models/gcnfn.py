@@ -1,91 +1,91 @@
 import argparse
-import copy as cp
 from pathlib import Path
+import copy as cp
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv, SAGEConv, GATConv
-from torch_geometric.nn import global_max_pool as gmp
+from torch_geometric.nn import GATConv, global_mean_pool
 
 from src.utils.data_loader import *
 from src.utils.pipeline_utils import (
-    METRIC_NAMES,
-    make_split,
-    plot_confusion_matrix,
-    plot_error_bar,
-    plot_loss,
-    plot_roc,
-    predict_loader,
-    print_summary,
-    save_csv,
-    save_seed_artifacts,
-    set_seed,
-    train_one_epoch,
+    set_seed, make_split, train_one_epoch, predict_loader,
+    save_csv, print_summary, save_seed_artifacts,
+    plot_error_bar, plot_loss, plot_confusion_matrix, plot_roc,
 )
 
 
-class Model(nn.Module):
-    """The user's original graph-classification baseline, normalized to our pipeline."""
+class Net(nn.Module):
+    """
+    Source-faithful GCNFN implementation.
 
-    def __init__(self, args):
+    Note: the uploaded source actually uses GATConv for both graph layers,
+    even though the model/file is called GCNFN. This code preserves that
+    architecture rather than silently replacing it with GCNConv.
+    """
+    def __init__(self, num_features, num_classes, nhid=128, concat=True):
         super().__init__()
-        self.num_features = args.num_features
-        self.nhid = args.nhid
-        self.num_classes = args.num_classes
-        self.model_type = args.model
-        self.concat = args.concat
 
-        if self.model_type == "gcn":
-            self.conv1 = GCNConv(self.num_features, self.nhid)
-        elif self.model_type == "sage":
-            self.conv1 = SAGEConv(self.num_features, self.nhid)
-        elif self.model_type == "gat":
-            self.conv1 = GATConv(self.num_features, self.nhid)
-        else:
-            raise ValueError(f"Unsupported model: {self.model_type}")
+        self.num_features = num_features
+        self.num_classes = num_classes
+        self.nhid = nhid
+        self.concat = concat
 
-        if self.concat:
-            self.lin0 = torch.nn.Linear(self.num_features, self.nhid)
-            self.lin1 = torch.nn.Linear(self.nhid * 2, self.nhid)
+        self.conv1 = GATConv(num_features, nhid * 2)
+        self.conv2 = GATConv(nhid * 2, nhid * 2)
 
-        self.lin2 = torch.nn.Linear(self.nhid, self.num_classes)
+        self.fc0 = nn.Linear(num_features, nhid) if concat else None
+        self.fc_graph = nn.Linear(nhid * 2, nhid)
+        self.fc_concat = nn.Linear(nhid * 2, nhid)
+        self.fc2 = nn.Linear(nhid, num_classes)
+
+    def _root_features(self, data):
+        # UPFD stores the source/news/root node first. Prefer root_index
+        # when present; otherwise fall back to the first node in each graph.
+        if hasattr(data, "root_index"):
+            roots = data.root_index.view(-1).long()
+            return data.x[roots]
+
+        root_nodes = []
+        batch = data.batch
+        for graph_id in range(data.num_graphs):
+            idx = torch.nonzero(batch == graph_id, as_tuple=False).view(-1)[0]
+            root_nodes.append(idx)
+        return data.x[torch.stack(root_nodes)]
 
     def forward(self, data):
-
         x, edge_index, batch = data.x, data.edge_index, data.batch
 
-        edge_attr = None
-
-        x = F.relu(self.conv1(x, edge_index, edge_attr))
-        x = gmp(x, batch)
+        x = F.selu(self.conv1(x, edge_index))
+        x = F.selu(self.conv2(x, edge_index))
+        x = F.selu(global_mean_pool(x, batch))
+        x = F.selu(self.fc_graph(x))
+        x = F.dropout(x, p=0.5, training=self.training)
 
         if self.concat:
-            news = torch.stack([data.x[(data.batch == idx).nonzero().squeeze()[0]] for idx in range(data.num_graphs)])
-            news = F.relu(self.lin0(news))
+            news = self._root_features(data)
+            news = F.relu(self.fc0(news))
             x = torch.cat([x, news], dim=1)
-            x = F.relu(self.lin1(x))
+            x = F.relu(self.fc_concat(x))
 
-        x = F.log_softmax(self.lin2(x), dim=-1)
+        return F.log_softmax(self.fc2(x), dim=-1)
 
-        return x
 
 def parse_args():
-    p = argparse.ArgumentParser(description="GNN baseline on UPFD with shared experiment pipeline")
+    p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="politifact", choices=["politifact", "gossipcop"])
     p.add_argument("--feature", default="bert", choices=["profile", "spacy", "bert", "content"])
-    p.add_argument("--model", default="sage", choices=["gcn", "sage", "gat"])
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=0.01)
-    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--nhid", type=int, default=128)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=10)
-    p.add_argument("--concat", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--concat", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seeds", type=int, nargs="+", default=[123, 456, 777, 101, 112])
-    p.add_argument("--out_dir", default="results/gnn")
+    p.add_argument("--out_dir", default="results/gcnfn")
     return p.parse_args()
 
 
@@ -100,41 +100,47 @@ def main():
         name=args.dataset,
         transform=ToUndirected(),
     )
-    args.num_classes = dataset.num_classes
-    args.num_features = dataset.num_features
 
     print(args)
-    print(
-        f"Dataset size={len(dataset)}, features={dataset.num_features}, "
-        f"classes={dataset.num_classes}, device={device}"
-    )
+    print(f"Dataset size={len(dataset)}, features={dataset.num_features}, classes={dataset.num_classes}")
+    print(f"Device={device}")
 
-    out_root = Path(args.out_dir) / args.dataset / args.feature / args.model
+    out_root = Path(args.out_dir) / args.dataset / args.feature
     out_root.mkdir(parents=True, exist_ok=True)
 
-    results = []
+    all_results = []
     best_plot_run = None
 
     for seed in args.seeds:
         print("\n" + "=" * 70)
-        print(f"GNN ({args.model.upper()}) | SEED {seed}")
+        print(f"GCNFN | SEED {seed}")
         print("=" * 70)
 
         set_seed(seed)
         train_set, val_set, test_set = make_split(dataset, seed)
+
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
         val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False)
         test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False)
 
-        model = Model(args).to(device)
+        model = Net(
+            dataset.num_features,
+            dataset.num_classes,
+            nhid=args.nhid,
+            concat=args.concat,
+        ).to(device)
+
         optimizer = torch.optim.Adam(
-            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
         )
 
         best_state = cp.deepcopy(model.state_dict())
         best_val_loss = float("inf")
         best_epoch = 0
         bad_epochs = 0
+
         history = {"train_loss": [], "val_loss": []}
 
         for epoch in range(1, args.epochs + 1):
@@ -164,13 +170,11 @@ def main():
             else:
                 bad_epochs += 1
                 if bad_epochs >= args.patience:
-                    print(
-                        f"Early stopping at epoch {epoch}; "
-                        f"best epoch={best_epoch}."
-                    )
+                    print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}.")
                     break
 
         model.load_state_dict(best_state)
+
         test_metrics, test_loss, y_true, y_prob = predict_loader(
             model, test_loader, device
         )
@@ -182,13 +186,12 @@ def main():
             "test_loss": test_loss,
             **test_metrics,
         }
-        results.append(result)
+        all_results.append(result)
 
-        seed_dir = out_root / f"seed_{seed}"
-        save_seed_artifacts(seed_dir, history, y_true, y_prob)
+        save_seed_artifacts(out_root / f"seed_{seed}", history, y_true, y_prob)
 
         print(
-            f"Seed {seed} Test | "
+            f"Seed {seed} | "
             f"acc={test_metrics['accuracy']:.4f}, "
             f"f1={test_metrics['f1']:.4f}, "
             f"precision={test_metrics['precision']:.4f}, "
@@ -197,7 +200,6 @@ def main():
             f"ap={test_metrics['ap']:.4f}"
         )
 
-        # Best validation-loss run is used for the per-model auxiliary plots.
         if best_plot_run is None or best_val_loss < best_plot_run["best_val_loss"]:
             best_plot_run = {
                 "seed": seed,
@@ -207,39 +209,28 @@ def main():
                 "y_prob": y_prob,
             }
 
-    summary = print_summary(
-        f"GNN-{args.model.upper()}", args.dataset, results
-    )
+    summary = print_summary("GCNFN", args.dataset, all_results)
 
     save_csv(
         out_root / "metrics_per_seed.csv",
-        results,
-        ["seed", "best_epoch", "best_val_loss", "test_loss"] + METRIC_NAMES,
+        all_results,
+        ["seed", "best_epoch", "best_val_loss", "test_loss"] + list(summary.keys()),
     )
     save_csv(
         out_root / "summary.csv",
         [
             {"metric": m, "mean": summary[m]["mean"], "std": summary[m]["std"]}
-            for m in METRIC_NAMES
+            for m in summary
         ],
         ["metric", "mean", "std"],
     )
 
-    plot_error_bar(summary, f"GNN-{args.model.upper()}", out_root)
-    plot_loss(
-        best_plot_run["history"],
-        f"GNN-{args.model.upper()}",
-        out_root,
-        best_plot_run["seed"],
-    )
+    plot_error_bar(summary, "GCNFN", out_root)
+    plot_loss(best_plot_run["history"], "GCNFN", out_root, best_plot_run["seed"])
     plot_confusion_matrix(
-        best_plot_run["y_true"], best_plot_run["y_prob"],
-        f"GNN-{args.model.upper()}", out_root,
+        best_plot_run["y_true"], best_plot_run["y_prob"], "GCNFN", out_root
     )
-    plot_roc(
-        best_plot_run["y_true"], best_plot_run["y_prob"],
-        f"GNN-{args.model.upper()}", out_root,
-    )
+    plot_roc(best_plot_run["y_true"], best_plot_run["y_prob"], "GCNFN", out_root)
 
     print(f"\nResults saved to: {out_root.resolve()}")
 
